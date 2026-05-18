@@ -1,0 +1,1480 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+===============================================================================
+JCP FINAL v4.0.7 (SUBMISSION-GRADE + REVIEWER PATCH)
+✅ Fixed Indentation Error — 100% Runable
+✅ Added Residual Preservation Test (Reviewer Required)
+✅ Added Projection Amplitude Statistics (Reviewer Required)
+✅ Fixed Burgers Constraint Violation Definition
+===============================================================================
+"""
+
+import os
+import json
+import time
+import math
+import logging
+import dataclasses
+from typing import List, Dict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.autograd as autograd
+from tqdm import tqdm
+
+# ==============================================================================
+# HYPERPARAMETERS
+# ==============================================================================
+RESULT_DIR = "jcp_results_reference"
+CHECKPOINT_DIR = os.path.join(RESULT_DIR, "checkpoints")
+SEED = 42
+LOG_INTERVAL = 200
+SAVE_CHECKPOINT_INTERVAL = 250
+
+MLP_IN_DIM = 2
+MLP_HIDDEN = 128
+MLP_DEPTH = 4
+ACTIVATION = "tanh"
+
+LEARNING_RATE = 1e-3
+ITERATIONS = 5000
+LR_MILESTONES = [2000, 3500, 4500]
+LR_GAMMA = 0.3
+WARMUP_ITERS = 600
+
+N_TRAIN_COLLOC = 4000
+N_IC_TRAIN = 256
+RESAMPLE_INTERVAL = 300
+RESAMPLE_RATIO = 0.4
+
+N_CAUSAL_WINDOWS = 10
+PDE_CAUSAL_TAU = {
+    "KdV": 1.2, "Burgers": 0.7, "NLS": 0.6, "KS": 2.5,
+}
+
+X_MIN = -10.0
+X_MAX = 10.0
+T_FINAL = 1.0
+N_INV_QUAD = 256
+N_TS_INVARIANT = 6
+T_EVAL_LIST = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+N_CONSERVATION_PTS = 40
+
+MU_PENALTY = 3.0
+IC_WEIGHT_VANILLA = 100.0
+LAMBDA_FIXED_IC = 8.0
+FIXED_LAMBDA_INV = {"KdV": 0.08, "Burgers": 0.008, "NLS": 0.008, "KS": 0.08}
+SA_INIT = 0.8
+SA_LR = 5e-4
+
+PROJ_NX = 512
+PROJ_CACHE_DECIMALS = 6
+PROJ_CACHE_MAXSIZE = 20000
+KDV_ALPHA_CLAMP = 5.0
+KS_ALPHA_CLAMP = 5.0
+NLS_SCALE_MIN = 0.1
+NLS_SCALE_MAX = 10.0
+NEWTON_MAX_ITER = 20
+NEWTON_TOL = 1e-10
+
+NX_REF = 1024
+DT_REF_DEFAULT = 1e-4
+DT_REF_KS = 5e-5
+SAVE_EVERY = 20
+N_RESID_TEST = 8000
+
+PDE_LIST = [
+    ("KdV", 1, "conservative"),
+    ("Burgers", 1, "dissipative"),
+    ("NLS", 2, "conservative"),
+    ("KS", 1, "conservative"),
+]
+
+# ==============================================================================
+# REPRODUCIBILITY
+# ==============================================================================
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+def set_seed(seed: int = SEED):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+set_seed(SEED)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
+log = logging.getLogger("JCP-FINAL-v4.0.7")
+
+# ==============================================================================
+# MLP
+# ==============================================================================
+class MLP(nn.Module):
+    def __init__(self, out_dim: int = 1):
+        super().__init__()
+        gain = 5.0 / 3.0 if ACTIVATION == "tanh" else 1.0
+        act_cls = {"tanh": nn.Tanh, "swish": nn.SiLU}[ACTIVATION]
+        layers = [nn.Linear(MLP_IN_DIM, MLP_HIDDEN), act_cls()]
+        for _ in range(MLP_DEPTH - 1):
+            layers += [nn.Linear(MLP_HIDDEN, MLP_HIDDEN), act_cls()]
+        layers.append(nn.Linear(MLP_HIDDEN, out_dim))
+        self.net = nn.Sequential(*layers)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=gain)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, xt: torch.Tensor) -> torch.Tensor:
+        return self.net(xt)
+
+
+# ==============================================================================
+# AUTOGRAD HELPER
+# ==============================================================================
+def grad(u: torch.Tensor, x: torch.Tensor, retain_graph=True) -> torch.Tensor:
+    return autograd.grad(
+        u, x,
+        grad_outputs=torch.ones_like(u),
+        create_graph=True,
+        retain_graph=retain_graph,
+    )[0]
+
+
+# ==============================================================================
+# PDE LIBRARY
+# ==============================================================================
+class PDE:
+    NU = 0.01
+
+    @staticmethod
+    def kdv_res(u, xt):
+        g = grad(u, xt, retain_graph=True)
+        ux, ut = g[:, [0]], g[:, [1]]
+        uxx = grad(ux, xt, retain_graph=True)[:, [0]]
+        uxxx = grad(uxx, xt, retain_graph=True)[:, [0]]
+        return ut + 6.0 * u * ux + uxxx
+
+    @staticmethod
+    def kdv_ic(x):
+        return 0.5 / torch.cosh(x / 2.0) ** 2
+
+    @staticmethod
+    def kdv_I(u, xt):
+        ux = grad(u, xt, retain_graph=True)[:, [0]]
+        integrand = 0.5 * ux**2 - u**3
+        x = xt[:, [0]]
+        return torch.trapezoid(integrand.squeeze(), x.squeeze())
+
+    @staticmethod
+    def kdv_I_ic(x: torch.Tensor) -> float:
+        u = PDE.kdv_ic(x).squeeze()
+        xx = x.squeeze()
+        dx = (xx[1] - xx[0]).item()
+        ux = torch.gradient(u, spacing=(dx,))[0]
+        integrand = 0.5 * ux**2 - u**3
+        I0 = torch.trapezoid(integrand, xx)
+        return float(I0.item())
+
+    @staticmethod
+    def burgers_res(u, xt):
+        g = grad(u, xt, retain_graph=True)
+        ux, ut = g[:, [0]], g[:, [1]]
+        uxx = grad(ux, xt, retain_graph=True)[:, [0]]
+        return ut + u * ux - PDE.NU * uxx
+
+    @staticmethod
+    def burgers_ic(x):
+        return -torch.sin(np.pi * x / 10.0)
+
+    @staticmethod
+    def burgers_E(u, xt):
+        x = xt[:, [0]]
+        return 0.5 * torch.trapezoid(u.squeeze() ** 2, x.squeeze())
+
+    @staticmethod
+    def burgers_D(u, xt):
+        ux = grad(u, xt, retain_graph=True)[:, [0]]
+        x = xt[:, [0]]
+        return PDE.NU * torch.trapezoid(ux.squeeze() ** 2, x.squeeze())
+
+    @staticmethod
+    def nls_res(u, xt):
+        ur, ui = u[:, [0]], u[:, [1]]
+        gr = grad(ur, xt, retain_graph=True)
+        gi = grad(ui, xt, retain_graph=True)
+        urx, urt = gr[:, [0]], gr[:, [1]]
+        uix, uit = gi[:, [0]], gi[:, [1]]
+        uxxr = grad(urx, xt, retain_graph=True)[:, [0]]
+        uxxi = grad(uix, xt, retain_graph=True)[:, [0]]
+        a2 = ur**2 + ui**2
+        return torch.cat([
+            uit + 0.5 * uxxr - a2 * ur,
+            -urt + 0.5 * uxxi - a2 * ui,
+        ], dim=1)
+
+    @staticmethod
+    def nls_ic(x):
+        return torch.exp(-x**2 / 2.0)
+
+    @staticmethod
+    def nls_I(u, xt):
+        integrand = u[:, 0]**2 + u[:, 1]**2
+        x = xt[:, [0]]
+        return torch.trapezoid(integrand.squeeze(), x.squeeze())
+
+    @staticmethod
+    def nls_I_ic(x: torch.Tensor) -> float:
+        u = PDE.nls_ic(x).squeeze()
+        xx = x.squeeze()
+        integrand = u**2
+        I0 = torch.trapezoid(integrand, xx)
+        return float(I0.item())
+
+    @staticmethod
+    def ks_res(u, xt):
+        g = grad(u, xt, retain_graph=True)
+        ux, ut = g[:, [0]], g[:, [1]]
+        uxx = grad(ux, xt, retain_graph=True)[:, [0]]
+        uxxx = grad(uxx, xt, retain_graph=True)[:, [0]]
+        uxxxx = grad(uxxx, xt, retain_graph=True)[:, [0]]
+        return ut + u * ux + uxx + uxxxx
+
+    @staticmethod
+    def ks_ic(x):
+        return torch.cos(np.pi * x / 16.0)
+
+    @staticmethod
+    def ks_I(u, xt):
+        x = xt[:, [0]]
+        return torch.trapezoid(u.squeeze(), x.squeeze())
+
+    @staticmethod
+    def ks_I_ic(x: torch.Tensor) -> float:
+        u = PDE.ks_ic(x).squeeze()
+        xx = x.squeeze()
+        I0 = torch.trapezoid(u, xx)
+        return float(I0.item())
+
+
+PDE_REGISTRY = {
+    "KdV": (PDE.kdv_res, PDE.kdv_ic, PDE.kdv_I),
+    "Burgers": (PDE.burgers_res, PDE.burgers_ic, None),
+    "NLS": (PDE.nls_res, PDE.nls_ic, PDE.nls_I),
+    "KS": (PDE.ks_res, PDE.ks_ic, PDE.ks_I),
+}
+
+# ==============================================================================
+# SAMPLING
+# ==============================================================================
+def sample_colloc(n):
+    x = torch.rand(n, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+    t = torch.rand(n, 1, device=DEVICE) * T_FINAL
+    return x, t
+
+
+def sample_ic(n):
+    return torch.linspace(X_MIN, X_MAX, n, device=DEVICE).unsqueeze(1)
+
+
+def quad_grid(nx, requires_grad=False):
+    g = torch.linspace(X_MIN, X_MAX, nx, device=DEVICE).unsqueeze(1)
+    if requires_grad:
+        return g.requires_grad_(True)
+    return g
+
+
+def time_slices(n):
+    return torch.linspace(0.0, T_FINAL, n, device=DEVICE)
+
+
+# ==============================================================================
+# CAUSAL LOSS
+# ==============================================================================
+def causal_pde_loss(model, x_f, t_f, residual_fn, tau):
+    edges = torch.linspace(0.0, T_FINAL, N_CAUSAL_WINDOWS + 1, device=DEVICE)
+    t_sq = t_f.squeeze()
+    win_losses = []
+    for k in range(N_CAUSAL_WINDOWS):
+        mask = (t_sq >= edges[k]) & (t_sq < edges[k + 1])
+        if mask.sum() == 0:
+            win_losses.append(torch.tensor(0.0, device=DEVICE))
+            continue
+        xt = torch.cat([x_f[mask], t_f[mask]], dim=1).requires_grad_(True)
+        r = residual_fn(model(xt), xt)
+        win_losses.append(torch.mean(r**2))
+    Lw = torch.stack(win_losses)
+    cumsum = torch.zeros_like(Lw)
+    for k in range(1, N_CAUSAL_WINDOWS):
+        cumsum[k] = cumsum[k - 1] + Lw[k - 1].detach()
+    weights = torch.exp(-tau * cumsum)
+    return (weights * Lw).sum(), Lw.detach()
+
+
+# ==============================================================================
+# R³ RESAMPLING
+# ==============================================================================
+def resample_collocation(model, x_f, t_f, residual_fn):
+    model.eval()
+    n = x_f.shape[0]
+    n_rep = int(n * RESAMPLE_RATIO)
+    with torch.enable_grad():
+        xt = torch.cat([x_f, t_f], dim=1).requires_grad_(True)
+        r = residual_fn(model(xt), xt)
+        mag = (r**2).mean(dim=1).detach()
+        _, keep = torch.topk(mag, n - n_rep, largest=True)
+        x_new = torch.rand(n_rep, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+        t_new = torch.rand(n_rep, 1, device=DEVICE) * T_FINAL
+    model.train()
+    return (
+        torch.cat([x_f[keep].detach(), x_new], dim=0),
+        torch.cat([t_f[keep].detach(), t_new], dim=0),
+    )
+
+
+# ==============================================================================
+# CONSTRAINT EVALUATION
+# ==============================================================================
+def constraint_conservative(model, ts, inv_fn, inv0, nx=N_INV_QUAD):
+    norm = abs(inv0) + 1e-12
+    cs = []
+    for t in ts:
+        x = quad_grid(nx, requires_grad=False)
+        xt = torch.cat([x, t.expand_as(x)], dim=1).requires_grad_(True)
+        u = model(xt)
+        I = inv_fn(u, xt)
+        cs.append((I - inv0) / norm)
+    return torch.stack(cs)
+
+
+def constraint_burgers(model, ts, inv0, nx=N_INV_QUAD):
+    norm = abs(inv0) + 1e-12
+    cs = []
+    for t in ts:
+        t_leaf = t.clone().detach().requires_grad_(True)
+        x = quad_grid(nx, requires_grad=False)
+        xt = torch.cat([x, t_leaf.expand_as(x)], dim=1).requires_grad_(True)
+        u = model(xt)
+        E = PDE.burgers_E(u, xt)
+        D = PDE.burgers_D(u, xt)
+        dEdt = autograd.grad(E, t_leaf, create_graph=False)[0]
+        cs.append((dEdt + D) / norm)
+    return torch.stack(cs)
+
+
+# ==============================================================================
+# IC LOSS
+# ==============================================================================
+def ic_loss(model, x_ic, ic_fn, out_dim):
+    xt = torch.cat([x_ic, torch.zeros_like(x_ic)], dim=1)
+    u0 = model(xt)
+    gt = ic_fn(x_ic)
+    if out_dim == 2:
+        gt = torch.cat([gt, torch.zeros_like(gt)], dim=1)
+    return torch.mean((u0 - gt) ** 2)
+
+
+# ==============================================================================
+# LOSS RECORD
+# ==============================================================================
+@dataclasses.dataclass
+class LossRecord:
+    Lp: List[float] = dataclasses.field(default_factory=list)
+    Lic: List[float] = dataclasses.field(default_factory=list)
+    Cinv: List[float] = dataclasses.field(default_factory=list)
+    Linv: List[float] = dataclasses.field(default_factory=list)
+    Ltot: List[float] = dataclasses.field(default_factory=list)
+    lam_ic: List[float] = dataclasses.field(default_factory=list)
+    lam_inv: List[float] = dataclasses.field(default_factory=list)
+
+
+# ==============================================================================
+# BASE PINN
+# ==============================================================================
+class BasePINN(nn.Module):
+    label = "base"
+    def __init__(self, out_dim, pde_type):
+        super().__init__()
+        self.out_dim = out_dim
+        self.pde_type = pde_type
+        self.net = MLP(out_dim)
+
+    def forward(self, xt):
+        return self.net(xt)
+
+    def compute_loss(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+# ==============================================================================
+# BASELINE METHODS
+# ==============================================================================
+class VanillaPINN(BasePINN):
+    label = "Vanilla"
+    def compute_loss(self, x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau):
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+        Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+        zero = torch.tensor(0.0, device=DEVICE)
+        return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+
+class PenaltyPINN(BasePINN):
+    label = "Penalty"
+    def compute_loss(self, x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau):
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+        zero = torch.tensor(0.0, device=DEVICE)
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+        linv = 0.5 * MU_PENALTY * torch.mean(c_stack**2)
+        Ltot = Lp + IC_WEIGHT_VANILLA * Lic + linv
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=torch.mean(torch.abs(c_stack)).detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+
+class FixedLambdaPINN(BasePINN):
+    label = "Fixed-λ"
+    def __init__(self, out_dim, pde_type, pde_name):
+        super().__init__(out_dim, pde_type)
+        self.lam_ic = float(LAMBDA_FIXED_IC)
+        self.lam_inv = float(FIXED_LAMBDA_INV.get(pde_name, 0.1))
+
+    def compute_loss(self, x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau):
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+        zero = torch.tensor(0.0, device=DEVICE)
+        if warmup:
+            Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic**2
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = torch.mean(self.lam_inv * c_stack + 0.5 * MU_PENALTY * c_stack**2)
+        Ltot = Lp + self.lam_ic * Lic + 0.5 * MU_PENALTY * Lic**2 + linv
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=torch.mean(torch.abs(c_stack)).detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+
+class SAPINN_Pos(BasePINN):
+    label = "SA-PINN-pos"
+    def __init__(self, out_dim, pde_type):
+        super().__init__(out_dim, pde_type)
+        self.log_lam_ic = nn.Parameter(torch.tensor(np.log(SA_INIT), dtype=torch.float32))
+        self.log_lam_inv = nn.Parameter(torch.tensor(np.log(SA_INIT), dtype=torch.float32))
+
+    @property
+    def lam_ic(self): return self.log_lam_ic.exp().item()
+
+    @property
+    def lam_inv(self): return self.log_lam_inv.exp().item()
+
+    def compute_loss(self, x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau):
+        lam_ic = self.log_lam_ic.exp()
+        lam_inv = self.log_lam_inv.exp()
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+        zero = torch.tensor(0.0, device=DEVICE)
+        if warmup:
+            Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+            return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+        if self.pde_type == "conservative":
+            c_stack = constraint_conservative(self, ts, inv_fn, inv0)
+        else:
+            c_stack = constraint_burgers(self, ts, inv0)
+
+        linv = torch.mean(lam_inv * torch.abs(c_stack) + 0.5 * MU_PENALTY * c_stack**2)
+        Ltot = Lp + lam_ic * Lic + 0.5 * MU_PENALTY * Lic**2 + linv
+        return Ltot, dict(
+            Lp=Lp, Lic=Lic,
+            Cinv=torch.mean(torch.abs(c_stack)).detach(),
+            Linv=linv.detach(),
+            Ltot=Ltot
+        )
+
+
+# ==============================================================================
+# TWO-STAGE CONSERVATION PROJECTION
+# ==============================================================================
+class TwoStageProjPINN(BasePINN):
+    label = "TwoStage-Proj"
+
+    def __init__(self, out_dim, pde_type, pde_name: str = "unknown"):
+        super().__init__(out_dim, pde_type)
+        self._pde_name = pde_name
+        self._proj_enabled = False
+        self._inv_fn = None
+        self._inv0 = None
+        self._L = float(X_MAX - X_MIN)
+        self._cache: Dict[float, float] = {}
+
+    def enable_projection(self, inv_fn, inv0):
+        self._proj_enabled = True
+        self._inv_fn = inv_fn
+        self._inv0 = float(inv0)
+        self._cache.clear()
+
+    def disable_projection(self):
+        self._proj_enabled = False
+        self._inv_fn = None
+        self._inv0 = None
+        self._cache.clear()
+
+    def _compute_kdv_alpha(self, t_val: float) -> float:
+        t_key = round(t_val, PROJ_CACHE_DECIMALS)
+        if t_key in self._cache:
+            return self._cache[t_key]
+
+        if len(self._cache) > PROJ_CACHE_MAXSIZE:
+            self._cache.clear()
+
+        x = quad_grid(PROJ_NX, requires_grad=False)
+        t = torch.full_like(x, t_val)
+        xt = torch.cat([x, t], dim=1).requires_grad_(True)
+
+        u_raw = self.net(xt)
+        ux = grad(u_raw, xt, retain_graph=True)[:, [0]]
+
+        I_kinetic = torch.trapezoid(0.5 * ux.squeeze()**2, x.squeeze()).detach().item()
+        M3 = torch.trapezoid(u_raw.squeeze()**3, x.squeeze()).detach().item()
+        M2 = torch.trapezoid(u_raw.squeeze()**2, x.squeeze()).detach().item()
+        M1 = torch.trapezoid(u_raw.squeeze(), x.squeeze()).detach().item()
+
+        I0 = self._inv0
+        L = self._L
+
+        def F(a):
+            return I_kinetic - M3 - 3*a*M2 - 3*a**2*M1 - a**3*L - I0
+
+        def dF_da(a):
+            return -3*M2 - 6*a*M1 - 3*a**2*L
+
+        alpha = (I0 - (I_kinetic - M3)) / (-3*M2 + 1e-12)
+        for _ in range(NEWTON_MAX_ITER):
+            f = F(alpha)
+            if abs(f) < NEWTON_TOL:
+                alpha = float(np.clip(alpha, -KDV_ALPHA_CLAMP, KDV_ALPHA_CLAMP))
+                self._cache[t_key] = alpha
+                return alpha
+            df = dF_da(alpha)
+            if abs(df) < 1e-14:
+                break
+            alpha -= f / df
+
+        if abs(F(alpha)) < NEWTON_TOL:
+            alpha = float(np.clip(alpha, -KDV_ALPHA_CLAMP, KDV_ALPHA_CLAMP))
+            self._cache[t_key] = alpha
+            return alpha
+
+        a_grid = torch.linspace(-KDV_ALPHA_CLAMP, KDV_ALPHA_CLAMP, 401, device=DEVICE)
+        f_grid = (I_kinetic - M3
+                  - 3*a_grid*M2
+                  - 3*a_grid**2 * M1
+                  - a_grid**3 * L
+                  - I0)
+
+        mask = f_grid[:-1] * f_grid[1:] <= 0
+        idxs = torch.where(mask)[0]
+
+        if len(idxs) > 0:
+            idx = idxs[0].item()
+            lo = a_grid[idx].item()
+            hi = a_grid[idx + 1].item()
+
+            lo_val = F(lo)
+            hi_val = F(hi)
+
+            if abs(lo_val) < NEWTON_TOL:
+                alpha = lo
+            elif abs(hi_val) < NEWTON_TOL:
+                alpha = hi
+            else:
+                for _ in range(60):
+                    mid = (lo + hi) / 2.0
+                    if F(mid) * F(lo) > 0:
+                        lo = mid
+                    else:
+                        hi = mid
+                alpha = (lo + hi) / 2.0
+        else:
+            best_idx = torch.argmin(torch.abs(f_grid)).item()
+            alpha = a_grid[best_idx].item()
+
+        alpha = float(np.clip(alpha, -KDV_ALPHA_CLAMP, KDV_ALPHA_CLAMP))
+        self._cache[t_key] = alpha
+        return alpha
+
+    def _compute_ks_alpha(self, t_val: float) -> float:
+        t_key = round(t_val, PROJ_CACHE_DECIMALS)
+        if t_key in self._cache:
+            return self._cache[t_key]
+
+        if len(self._cache) > PROJ_CACHE_MAXSIZE:
+            self._cache.clear()
+
+        x = quad_grid(PROJ_NX, requires_grad=False)
+        t = torch.full_like(x, t_val)
+        xt = torch.cat([x, t], dim=1)
+
+        u_raw = self.net(xt)
+        I_raw = torch.trapezoid(u_raw.squeeze(), x.squeeze()).item()
+
+        alpha = (self._inv0 - I_raw) / (self._L + 1e-12)
+        alpha = float(np.clip(alpha, -KS_ALPHA_CLAMP, KS_ALPHA_CLAMP))
+
+        self._cache[t_key] = alpha
+        return alpha
+
+    def _compute_nls_scale(self, t_val: float) -> float:
+        t_key = round(t_val, PROJ_CACHE_DECIMALS)
+        if t_key in self._cache:
+            return self._cache[t_key]
+
+        if len(self._cache) > PROJ_CACHE_MAXSIZE:
+            self._cache.clear()
+
+        x = quad_grid(PROJ_NX, requires_grad=False)
+        t = torch.full_like(x, t_val)
+        xt = torch.cat([x, t], dim=1)
+
+        u_raw = self.net(xt)
+        I_raw = torch.trapezoid(u_raw[:, 0]**2 + u_raw[:, 1]**2, x.squeeze()).item()
+
+        ratio = self._inv0 / (I_raw + 1e-12)
+        ratio = max(ratio, 0.0)
+        s = math.sqrt(ratio + 1e-12)
+        s = float(np.clip(s, NLS_SCALE_MIN, NLS_SCALE_MAX))
+
+        self._cache[t_key] = s
+        return s
+
+    def forward_raw(self, xt: torch.Tensor) -> torch.Tensor:
+        return self.net(xt)
+
+    def forward_proj(self, xt: torch.Tensor) -> torch.Tensor:
+        u_raw = self.net(xt)
+
+        if not self._proj_enabled or self.pde_type != "conservative":
+            return u_raw
+
+        scale = float(10**PROJ_CACHE_DECIMALS)
+        t_keys = torch.round(xt[:, 1] * scale) / scale
+        uniq_keys, inv_idx = torch.unique(t_keys, return_inverse=True)
+
+        params = []
+        uniq_list = uniq_keys.detach().cpu().tolist()
+        for tv in uniq_list:
+            if self.out_dim == 1:
+                if self._pde_name == "KdV":
+                    params.append(self._compute_kdv_alpha(float(tv)))
+                elif self._pde_name == "KS":
+                    params.append(self._compute_ks_alpha(float(tv)))
+                else:
+                    params.append(self._compute_kdv_alpha(float(tv)))
+            else:
+                params.append(self._compute_nls_scale(float(tv)))
+
+        params = torch.tensor(params, device=DEVICE, dtype=u_raw.dtype).view(-1, 1)
+        param_per_row = params[inv_idx]
+
+        if self.out_dim == 1:
+            return u_raw + param_per_row
+        else:
+            return u_raw * param_per_row
+
+    def forward(self, xt):
+        return self.forward_raw(xt)
+
+    def compute_loss(self, x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau):
+        Lp, _ = causal_pde_loss(self, x_f, t_f, residual_fn, tau)
+        Lic = ic_loss(self, x_ic, ic_fn, self.out_dim)
+        Ltot = Lp + IC_WEIGHT_VANILLA * Lic
+        zero = torch.tensor(0.0, device=DEVICE)
+        return Ltot, dict(Lp=Lp, Lic=Lic, Cinv=zero, Linv=zero, Ltot=Ltot)
+
+
+# ==============================================================================
+# CHECKPOINT
+# ==============================================================================
+def get_checkpoint_path(pde_name, method_label):
+    safe = method_label.replace(" ", "_")
+    return os.path.join(CHECKPOINT_DIR, f"ckpt_{pde_name}_{safe}.pth")
+
+
+def save_checkpoint(pde_name, method_label, model, optimizers, scheduler, current_iter, loss_rec):
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "current_iter": current_iter,
+        "loss_rec": dataclasses.asdict(loss_rec),
+        "method": method_label,
+        "pde": pde_name,
+    }
+    if isinstance(optimizers, (list, tuple)):
+        checkpoint["opt_states"] = [opt.state_dict() for opt in optimizers]
+    else:
+        checkpoint["opt_states"] = [optimizers.state_dict()] if optimizers else None
+    if scheduler:
+        checkpoint["scheduler_state"] = scheduler.state_dict()
+    torch.save(checkpoint, get_checkpoint_path(pde_name, method_label))
+
+
+def load_checkpoint(pde_name, method_label, model, optimizers, scheduler):
+    ckpt_path = get_checkpoint_path(pde_name, method_label)
+    if not os.path.exists(ckpt_path):
+        return 0, LossRecord()
+
+    log.info(f"✅ Load checkpoint: {pde_name} | {method_label}")
+    checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(checkpoint["model_state"], strict=False)
+
+    if checkpoint.get("opt_states") and optimizers is not None:
+        if isinstance(optimizers, (list, tuple)):
+            for opt, s in zip(optimizers, checkpoint["opt_states"]):
+                opt.load_state_dict(s)
+        else:
+            optimizers.load_state_dict(checkpoint["opt_states"][0])
+
+    if scheduler and "scheduler_state" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+
+    current_iter = checkpoint.get("current_iter", 0)
+    loss_rec = LossRecord(**checkpoint.get("loss_rec", {}))
+    return current_iter, loss_rec
+
+
+# ==============================================================================
+# TRAIN LOOP
+# ==============================================================================
+def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, pde_name, desc=""):
+    if isinstance(model, SAPINN_Pos):
+        net_opt = torch.optim.Adam(model.net.parameters(), lr=LEARNING_RATE)
+        dual_opt = torch.optim.Adam([model.log_lam_ic, model.log_lam_inv], lr=SA_LR)
+        optimizers = [net_opt, dual_opt]
+        scheduler = None
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        optimizers = opt
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, LR_MILESTONES, LR_GAMMA)
+
+    start_iter, rec = load_checkpoint(pde_name, model.label, model, optimizers, scheduler)
+
+    ts = time_slices(N_TS_INVARIANT)
+    x_ic = sample_ic(N_IC_TRAIN)
+    x_f, t_f = sample_colloc(N_TRAIN_COLLOC)
+
+    pbar = tqdm(range(start_iter + 1, ITERATIONS + 1), desc=desc, ncols=120, leave=False)
+
+    for it in pbar:
+        warmup = it <= WARMUP_ITERS
+
+        if RESAMPLE_INTERVAL > 0 and not warmup and (it - WARMUP_ITERS) % RESAMPLE_INTERVAL == 0:
+            x_f, t_f = resample_collocation(model, x_f, t_f, residual_fn)
+
+        model.train()
+
+        if isinstance(model, SAPINN_Pos):
+            loss_net, comps = model.compute_loss(
+                x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau
+            )
+            net_opt, dual_opt = optimizers
+            net_opt.zero_grad()
+            loss_net.backward()
+            nn.utils.clip_grad_norm_(model.net.parameters(), 1.0)
+            net_opt.step()
+
+            if not warmup:
+                lic_val = comps["Lic"].detach()
+                c_inv = comps["Cinv"].detach()
+                lam_ic = model.log_lam_ic.exp()
+                lam_inv = model.log_lam_inv.exp()
+                dual_loss = -(lam_ic * lic_val + lam_inv * c_inv)
+                dual_opt.zero_grad()
+                dual_loss.backward()
+                dual_opt.step()
+            else:
+                dual_opt.zero_grad()
+
+        else:
+            opt = optimizers
+            opt.zero_grad()
+            loss, comps = model.compute_loss(
+                x_f, t_f, x_ic, ts, residual_fn, ic_fn, inv_fn, inv0, warmup, tau
+            )
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            if scheduler:
+                scheduler.step()
+
+        scalars = {}
+        for k, v in comps.items():
+            scalars[k] = float(v.item()) if torch.is_tensor(v) else v
+        scalars["warmup"] = warmup
+
+        rec.Lp.append(float(scalars["Lp"]))
+        rec.Lic.append(float(scalars["Lic"]))
+        rec.Cinv.append(float(scalars["Cinv"]))
+        rec.Linv.append(float(scalars["Linv"]))
+        rec.Ltot.append(float(scalars["Ltot"]))
+
+        if isinstance(model, SAPINN_Pos):
+            rec.lam_ic.append(float(model.lam_ic))
+            rec.lam_inv.append(float(model.lam_inv))
+        else:
+            rec.lam_ic.append(0.0)
+            rec.lam_inv.append(0.0)
+
+        if it % LOG_INTERVAL == 0:
+            pbar.set_postfix(
+                Lp=f"{float(scalars['Lp']):.1e}",
+                Lic=f"{float(scalars['Lic']):.1e}",
+                W="Y" if warmup else "N",
+            )
+
+        if it % SAVE_CHECKPOINT_INTERVAL == 0:
+            save_checkpoint(pde_name, model.label, model, optimizers, scheduler, it, rec)
+
+    save_checkpoint(pde_name, model.label, model, optimizers, scheduler, ITERATIONS, rec)
+    return rec
+
+
+# ==============================================================================
+# EVALUATION
+# ==============================================================================
+def eval_residual_oos_raw(model, residual_fn, n=N_RESID_TEST, batch_size=500):
+    model.eval()
+    chunks = []
+    done = 0
+    with torch.enable_grad():
+        while done < n:
+            m = min(batch_size, n - done)
+            x = torch.rand(m, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+            t = torch.rand(m, 1, device=DEVICE) * T_FINAL
+            xt = torch.cat([x, t], dim=1).requires_grad_(True)
+            u = model.forward_raw(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+            r = residual_fn(u, xt)
+            r2 = (r**2).mean(dim=1).detach()
+            chunks.append(r2)
+            done += m
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+    r2_all = torch.cat(chunks, dim=0)
+    return {"mean": float(r2_all.mean().item()),
+            "max": float(r2_all.max().item()),
+            "p95": float(torch.quantile(r2_all, 0.95).item())}
+
+
+# ==============================================================================
+# 新增：投影后PDE残差评估（审稿人核心要求）
+# ==============================================================================
+def eval_residual_oos_proj(model, residual_fn, n=N_RESID_TEST, batch_size=500):
+    model.eval()
+    chunks = []
+    done = 0
+    with torch.enable_grad():
+        while done < n:
+            m = min(batch_size, n - done)
+            x = torch.rand(m, 1, device=DEVICE) * (X_MAX - X_MIN) + X_MIN
+            t = torch.rand(m, 1, device=DEVICE) * T_FINAL
+            xt = torch.cat([x, t], dim=1).requires_grad_(True)
+            u = model.forward_proj(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+            r = residual_fn(u, xt)
+            r2 = (r**2).mean(dim=1).detach()
+            chunks.append(r2)
+            done += m
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+    r2_all = torch.cat(chunks, dim=0)
+    return {"mean": float(r2_all.mean().item()),
+            "max": float(r2_all.max().item()),
+            "p95": float(torch.quantile(r2_all, 0.95).item())}
+
+
+# ==============================================================================
+# 新增：投影参数统计（α/s的最大/平均值，支撑"微扰"结论）
+# ==============================================================================
+def get_projection_stats(model, ts):
+    if not isinstance(model, TwoStageProjPINN) or not model._proj_enabled:
+        return None
+    params = []
+    for t in ts:
+        t_val = float(t)
+        if model.out_dim == 1:
+            if model._pde_name == "KdV":
+                params.append(model._compute_kdv_alpha(t_val))
+            elif model._pde_name == "KS":
+                params.append(model._compute_ks_alpha(t_val))
+            else:
+                params.append(model._compute_kdv_alpha(t_val))
+        else:
+            params.append(model._compute_nls_scale(t_val))
+    params_np = np.array(params)
+    if model.out_dim == 1:
+        return {
+            "mean_abs_alpha": float(np.mean(np.abs(params_np))),
+            "max_abs_alpha": float(np.max(np.abs(params_np))),
+            "std_alpha": float(np.std(params_np))
+        }
+    else:
+        return {
+            "mean_abs_s_minus_1": float(np.mean(np.abs(params_np - 1.0))),
+            "max_abs_s_minus_1": float(np.max(np.abs(params_np - 1.0))),
+            "std_s": float(np.std(params_np))
+        }
+
+
+def eval_vs_reference_raw(model, x_ref, t_ref, u_ref, out_dim):
+    model.eval()
+
+    x_pt = torch.tensor(x_ref, device=DEVICE, dtype=torch.float32)
+    t_pt = torch.tensor(t_ref, device=DEVICE, dtype=torch.float32)
+
+    nx = x_pt.shape[0]
+    nt = t_pt.shape[0]
+
+    X = x_pt.view(1, nx).repeat(nt, 1)
+    T = t_pt.view(nt, 1).repeat(1, nx)
+
+    xt = torch.stack([X, T], dim=2).reshape(nt * nx, 2)
+
+    with torch.no_grad():
+        if isinstance(model, TwoStageProjPINN):
+            u_pred = model.forward_raw(xt).reshape(nt, nx, out_dim).cpu().numpy()
+        else:
+            u_pred = model(xt).reshape(nt, nx, out_dim).cpu().numpy()
+
+    errs_l2, errs_linf = [], []
+    for i in range(nt):
+        u_true = u_ref[i]
+        if out_dim == 1:
+            e = u_pred[i, :, 0] - u_true[:, 0]
+            errs_l2.append(float(np.sqrt(np.mean(e**2))))
+            errs_linf.append(float(np.max(np.abs(e))))
+        else:
+            er = u_pred[i, :, 0] - u_true[:, 0]
+            ei = u_pred[i, :, 1] - u_true[:, 1]
+            en = np.sqrt(er**2 + ei**2)
+            errs_l2.append(float(np.sqrt(np.mean(en**2))))
+            errs_linf.append(float(np.max(en)))
+
+    return {"t": t_ref.tolist(), "l2": errs_l2, "linf": errs_linf,
+            "mean_l2": float(np.mean(errs_l2)), "max_linf": float(np.max(errs_linf))}
+
+
+def eval_vs_reference_proj(model, x_ref, t_ref, u_ref, out_dim):
+    model.eval()
+    x_pt = torch.tensor(x_ref, device=DEVICE, dtype=torch.float32)
+    t_pt = torch.tensor(t_ref, device=DEVICE, dtype=torch.float32)
+    nx = x_pt.shape[0]
+    nt = t_pt.shape[0]
+    X = x_pt.view(1, nx).repeat(nt, 1)
+    T = t_pt.view(nt, 1).repeat(1, nx)
+    xt = torch.stack([X, T], dim=2).reshape(nt * nx, 2)
+
+    u_pred_chunks = []
+    CHUNK = 50000
+    with torch.enable_grad():
+        for s in range(0, xt.shape[0], CHUNK):
+            c = xt[s:s+CHUNK].detach().clone().requires_grad_(True)
+            u_pred_chunks.append(model.forward_proj(c).detach())
+    u_pred = torch.cat(u_pred_chunks).reshape(nt, nx, out_dim).cpu().numpy()
+
+    errs_l2, errs_linf = [], []
+    for i in range(nt):
+        u_true = u_ref[i]
+        if out_dim == 1:
+            e = u_pred[i, :, 0] - u_true[:, 0]
+            errs_l2.append(float(np.sqrt(np.mean(e**2))))
+            errs_linf.append(float(np.max(np.abs(e))))
+        else:
+            er = u_pred[i, :, 0] - u_true[:, 0]
+            ei = u_pred[i, :, 1] - u_true[:, 1]
+            en = np.sqrt(er**2 + ei**2)
+            errs_l2.append(float(np.sqrt(np.mean(en**2))))
+            errs_linf.append(float(np.max(en)))
+
+    return {"t": t_ref.tolist(), "l2": errs_l2, "linf": errs_linf,
+            "mean_l2": float(np.mean(errs_l2)), "max_linf": float(np.max(errs_linf))}
+
+
+def eval_burgers_identity(model, inv0, n_quad=N_INV_QUAD):
+    model.eval()
+    norm = abs(inv0) + 1e-12
+    resid_list, diss_list = [], []
+    with torch.enable_grad():
+        for t in T_EVAL_LIST:
+            x = quad_grid(n_quad, requires_grad=False)
+            t_leaf = torch.tensor(float(t), device=DEVICE, requires_grad=True)
+            xt = torch.cat([x, t_leaf.expand_as(x)], dim=1).requires_grad_(True)
+            u = model.forward_raw(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+            E = PDE.burgers_E(u, xt)
+            D = PDE.burgers_D(u, xt)
+            dEdt = autograd.grad(E, t_leaf, create_graph=False)[0]
+            r = dEdt + D
+            resid_list.append(float((r / norm).abs().item()))
+            diss_list.append(float((D / norm).abs().item()))
+    return {
+        "mean_abs_dEdt_plus_D": float(np.mean(resid_list)),
+        "max_abs_dEdt_plus_D": float(np.max(resid_list)),
+        "mean_abs_D": float(np.mean(diss_list)),
+        "max_abs_D": float(np.max(diss_list)),
+    }
+
+
+def eval_constraint_error_raw(model, pde_type, inv_fn, inv0):
+    if pde_type == "dissipative":
+        return eval_burgers_identity(model, inv0, n_quad=N_INV_QUAD)
+
+    model.eval()
+    norm = abs(inv0) + 1e-12
+    errs = []
+    with torch.enable_grad():
+        for t in T_EVAL_LIST:
+            x = quad_grid(N_INV_QUAD, requires_grad=False)
+            xt = torch.cat([x, float(t) * torch.ones_like(x)], dim=1).requires_grad_(True)
+            u = model.forward_raw(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+            I = inv_fn(u, xt)
+            c = torch.abs((I - inv0) / norm)
+            errs.append(c.detach())
+
+    errs = torch.stack(errs)
+    return {"mean": float(errs.mean().item()),
+            "max": float(errs.max().item())}
+
+
+def eval_constraint_error_proj(model, pde_type, inv_fn, inv0):
+    if pde_type == "dissipative":
+        return eval_burgers_identity(model, inv0, n_quad=N_INV_QUAD)
+
+    model.eval()
+    norm = abs(inv0) + 1e-12
+    errs = []
+    with torch.enable_grad():
+        for t in T_EVAL_LIST:
+            x = quad_grid(PROJ_NX, requires_grad=False)
+            xt = torch.cat([x, float(t) * torch.ones_like(x)], dim=1).requires_grad_(True)
+            u = model.forward_proj(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+            I = inv_fn(u, xt)
+            c = torch.abs((I - inv0) / norm)
+            errs.append(c.detach())
+
+    errs = torch.stack(errs)
+    return {"mean": float(errs.mean().item()),
+            "max": float(errs.max().item())}
+
+
+def conservation_curve_proj(model, pde_type, inv_fn, inv0):
+    model.eval()
+    norm = abs(inv0) + 1e-12
+    t_arr = np.linspace(0.0, T_FINAL, N_CONSERVATION_PTS)
+
+    if pde_type == "dissipative":
+        vals_resid, vals_D = [], []
+        for t in t_arr:
+            with torch.enable_grad():
+                x = quad_grid(N_INV_QUAD, requires_grad=False)
+                t_leaf = torch.tensor(float(t), device=DEVICE, requires_grad=True)
+                xt = torch.cat([x, t_leaf.expand_as(x)], dim=1).requires_grad_(True)
+                u = model.forward_raw(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+                E = PDE.burgers_E(u, xt)
+                D = PDE.burgers_D(u, xt)
+                dEdt = autograd.grad(E, t_leaf, create_graph=False)[0]
+                vals_resid.append(float(((dEdt + D) / norm).item()))
+                vals_D.append(float((D / norm).item()))
+        return {
+            "t": t_arr.tolist(),
+            "c_energy_identity": vals_resid,
+            "c_dissipation": vals_D,
+            "mean_abs_identity": float(np.mean(np.abs(vals_resid))),
+            "max_abs_identity": float(np.max(np.abs(vals_resid))),
+            "mean_abs_D": float(np.mean(np.abs(vals_D))),
+            "max_abs_D": float(np.max(np.abs(vals_D))),
+            "drift_rate_identity": float(np.polyfit(t_arr, vals_resid, 1)[0]),
+            "drift_rate_D": float(np.polyfit(t_arr, vals_D, 1)[0]),
+        }
+
+    vals = []
+    for t in t_arr:
+        with torch.enable_grad():
+            x = quad_grid(PROJ_NX, requires_grad=False)
+            xt = torch.cat([x, float(t) * torch.ones_like(x)], dim=1).requires_grad_(True)
+            u = model.forward_proj(xt) if isinstance(model, TwoStageProjPINN) else model(xt)
+            I = inv_fn(u, xt)
+            vals.append(((I - inv0) / norm).detach())
+
+    vals_np = torch.stack(vals).cpu().numpy()
+    return {"t": t_arr.tolist(), "c": vals_np.tolist(),
+            "mean_abs": float(np.mean(np.abs(vals_np))),
+            "max_abs": float(np.max(np.abs(vals_np))),
+            "drift_rate": float(np.polyfit(t_arr, vals_np, 1)[0])}
+
+
+# ==============================================================================
+# REFERENCE SOLVER (ETDRK4)
+# ==============================================================================
+def spectral_grid(nx=NX_REF):
+    x = np.linspace(X_MIN, X_MAX, nx, endpoint=False)
+    L = X_MAX - X_MIN
+    k = (2.0 * np.pi / L) * np.fft.fftfreq(nx, d=L / nx)
+    return x, k
+
+
+def etdrk4_coeffs(Lk, dt):
+    E = np.exp(dt * Lk)
+    E2 = np.exp(dt * Lk / 2.0)
+    M = 16
+    r = np.exp(1j * np.pi * (np.arange(1, M + 1) - 0.5) / M)
+    LR = dt * Lk[:, None] + r[None, :]
+    Q = dt * np.real(np.mean((np.exp(LR / 2.0) - 1.0) / LR, axis=1))
+    f1 = dt * np.real(np.mean((-4 - LR + np.exp(LR)*(4 - 3*LR + LR**2)) / LR**3, axis=1))
+    f2 = dt * np.real(np.mean((2 + LR + np.exp(LR)*(-2 + LR)) / LR**3, axis=1))
+    f3 = dt * np.real(np.mean((-4 - 3*LR - LR**2 + np.exp(LR)*(4 - LR)) / LR**3, axis=1))
+    return E, E2, Q, f1, f2, f3
+
+
+def solve_reference(pde_name: str, out_dim: int):
+    x, k = spectral_grid(NX_REF)
+    dt = DT_REF_KS if pde_name == "KS" else DT_REF_DEFAULT
+    nsteps = int(round(T_FINAL / dt))
+    save_idx = np.arange(0, nsteps + 1, SAVE_EVERY)
+    t_save = save_idx * dt
+    if t_save[-1] < T_FINAL - 1e-12:
+        save_idx = np.append(save_idx, nsteps)
+        t_save = np.append(t_save, nsteps * dt)
+
+    x_torch = torch.tensor(x, dtype=torch.float64)
+    if pde_name == "KdV":
+        u0 = (0.5 / torch.cosh(x_torch / 2.0) ** 2).numpy()
+        u = u0.astype(np.complex128); out_dim = 1
+    elif pde_name == "Burgers":
+        u0 = (-torch.sin(np.pi * x_torch / 10.0)).numpy()
+        u = u0.astype(np.complex128); out_dim = 1
+    elif pde_name == "NLS":
+        u0 = torch.exp(-x_torch**2 / 2.0).numpy()
+        u = u0.astype(np.complex128); out_dim = 2
+    elif pde_name == "KS":
+        u0 = torch.cos(np.pi * x_torch / 16.0).numpy()
+        u = u0.astype(np.complex128); out_dim = 1
+    else:
+        raise ValueError(pde_name)
+
+    ik = 1j * k
+    k2 = k**2
+
+    if pde_name == "KdV":
+        Lk = 1j * k**3
+        def N(u_phys):
+            ux = np.fft.ifft(ik * np.fft.fft(u_phys)).real
+            return -6.0 * u_phys * ux
+    elif pde_name == "Burgers":
+        nu = PDE.NU
+        Lk = -nu * k**2
+        def N(u_phys):
+            ux = np.fft.ifft(ik * np.fft.fft(u_phys)).real
+            return -(u_phys * ux)
+    elif pde_name == "NLS":
+        Lk = 1j * (-0.5 * k2)
+        def N(u_phys):
+            return -1j * np.abs(u_phys)**2 * u_phys
+    elif pde_name == "KS":
+        Lk = k2 - k**4
+        def N(u_phys):
+            ux = np.fft.ifft(ik * np.fft.fft(u_phys)).real
+            return -(u_phys * ux)
+    else:
+        raise ValueError(pde_name)
+
+    E, E2, Q, f1, f2, f3 = etdrk4_coeffs(Lk.astype(np.complex128), dt)
+    u_save = np.zeros((len(t_save), NX_REF, out_dim), dtype=np.float64)
+    save_ptr = 0
+
+    def save_state(uc):
+        nonlocal save_ptr
+        if pde_name == "NLS":
+            u_save[save_ptr, :, 0] = uc.real
+            u_save[save_ptr, :, 1] = uc.imag
+        else:
+            u_save[save_ptr, :, 0] = uc.real
+        save_ptr += 1
+
+    save_state(u)
+    v = np.fft.fft(u)
+    for n in range(1, nsteps + 1):
+        up = np.fft.ifft(v).real if pde_name != "NLS" else np.fft.ifft(v)
+        Nv = np.fft.fft(N(up))
+        a = E2*v + Q*Nv
+        ua = np.fft.ifft(a).real if pde_name != "NLS" else np.fft.ifft(a)
+        Na = np.fft.fft(N(ua))
+        b = E2*v + Q*Na
+        ub = np.fft.ifft(b).real if pde_name != "NLS" else np.fft.ifft(b)
+        Nb = np.fft.fft(N(ub))
+        c = E2*a + Q*(2*Nb-Nv)
+        uc = np.fft.ifft(c).real if pde_name != "NLS" else np.fft.ifft(c)
+        Nc = np.fft.fft(N(uc))
+        v = E*v + Nv*f1 + (Na+Nb)*f2 + Nc*f3
+        if n in save_idx:
+            save_state(np.fft.ifft(v))
+
+    return x, t_save, u_save
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+METHODS_REGISTRY = [
+    VanillaPINN, PenaltyPINN, FixedLambdaPINN, SAPINN_Pos, TwoStageProjPINN,
+]
+
+
+def main():
+    log.info("Starting JCP FINAL v4.0.7 (Reviewer Patch)")
+    log.info(f"Device: {DEVICE}")
+    log.info(f"Methods: {[m.label for m in METHODS_REGISTRY]}")
+
+    global_summary, ablation_table = {}, {}
+    conservation_data, lambda_history = {}, {}
+
+    for (pde_name, out_dim, pde_type) in PDE_LIST:
+        log.info("=" * 60)
+        log.info(f"PDE = {pde_name}")
+
+        residual_fn, ic_fn, inv_fn = PDE_REGISTRY[pde_name]
+
+        ref_path = os.path.join(RESULT_DIR, f"ref_{pde_name}.npz")
+        if os.path.exists(ref_path):
+            log.info("Load reference")
+            data = np.load(ref_path)
+            x_ref, t_ref, u_ref = data["x"], data["t"], data["u"]
+        else:
+            log.info("Solve reference (ETDRK4)")
+            x_ref, t_ref, u_ref = solve_reference(pde_name, out_dim)
+            np.savez_compressed(ref_path, x=x_ref, t=t_ref, u=u_ref)
+
+        x0 = quad_grid(N_INV_QUAD, requires_grad=False)
+
+        if pde_name == "KdV":
+            inv0 = PDE.kdv_I_ic(x0)
+        elif pde_name == "NLS":
+            inv0 = PDE.nls_I_ic(x0)
+        elif pde_name == "KS":
+            inv0 = PDE.ks_I_ic(x0)
+        else:
+            xt0 = torch.cat([x0, torch.zeros_like(x0)], dim=1)
+            u0 = PDE.burgers_ic(x0)
+            inv0 = float(PDE.burgers_E(u0, xt0).item())
+
+        log.info(f"I0 = {inv0:.4e}")
+
+        pde_results = {}
+        pde_ablation = {}
+        pde_conservation = {}
+        pde_lambda = {}
+
+        tau = PDE_CAUSAL_TAU[pde_name]
+
+        for MethodCls in METHODS_REGISTRY:
+            log.info(f"Method: {MethodCls.label}")
+
+            if MethodCls is FixedLambdaPINN:
+                model = MethodCls(out_dim, pde_type, pde_name).to(DEVICE)
+            elif MethodCls is TwoStageProjPINN:
+                model = MethodCls(out_dim, pde_type, pde_name).to(DEVICE)
+            else:
+                model = MethodCls(out_dim, pde_type).to(DEVICE)
+
+            rec = train_model(
+                model, residual_fn, ic_fn, inv_fn, inv0, tau,
+                pde_name, f"{pde_name}|{MethodCls.label}"
+            )
+
+            proj_stats = None
+            resid_oos_proj = None
+            if isinstance(model, TwoStageProjPINN) and pde_type == "conservative":
+                log.info("Enabling projection (evaluation only)...")
+                model.enable_projection(inv_fn, inv0)
+                # 新增：计算投影参数统计
+                proj_stats = get_projection_stats(model, time_slices(N_CONSERVATION_PTS))
+                # 新增：计算投影后PDE残差
+                resid_oos_proj = eval_residual_oos_proj(model, residual_fn)
+
+            resid_oos = eval_residual_oos_raw(model, residual_fn)
+            c_err_raw = eval_constraint_error_raw(model, pde_type, inv_fn, inv0)
+            c_err_proj = eval_constraint_error_proj(model, pde_type, inv_fn, inv0)
+            conv = conservation_curve_proj(model, pde_type, inv_fn, inv0)
+            ref_err = eval_vs_reference_raw(model, x_ref, t_ref, u_ref, out_dim)
+
+            ref_err_proj = None
+            if isinstance(model, TwoStageProjPINN):
+                ref_err_proj = eval_vs_reference_proj(model, x_ref, t_ref, u_ref, out_dim)
+
+            if pde_type == "dissipative":
+                mean_c_raw = c_err_raw["mean_abs_dEdt_plus_D"]
+                mean_c_proj = c_err_proj["mean_abs_dEdt_plus_D"]
+                drift = conv["drift_rate_identity"]
+            else:
+                mean_c_raw = c_err_raw["mean"]
+                mean_c_proj = c_err_proj["mean"]
+                drift = conv["drift_rate"]
+
+            res_dict = {
+                "label": MethodCls.label,
+                "losses": {
+                    "Lp": rec.Lp, "Lic": rec.Lic,
+                    "Cinv": rec.Cinv, "Linv": rec.Linv,
+                    "Ltot": rec.Ltot
+                },
+                "lambda": {"lam_ic": rec.lam_ic, "lam_inv": rec.lam_inv},
+                "metrics": {
+                    "residual_oos": resid_oos,
+                    "residual_oos_proj": resid_oos_proj,  # 新增
+                    "projection_stats": proj_stats,        # 新增
+                    "constraint_raw": c_err_raw,
+                    "constraint_proj": c_err_proj,
+                    "conservation": conv,
+                    "reference_error": ref_err,
+                    "reference_error_proj": ref_err_proj,
+                },
+            }
+
+            pde_results[MethodCls.label] = res_dict
+            pde_conservation[MethodCls.label] = conv
+            pde_lambda[MethodCls.label] = {"lam_ic": rec.lam_ic, "lam_inv": rec.lam_inv}
+
+            # 消融表新增审稿人要求的字段
+            ablation_entry = {
+                "mean_l2_ref": ref_err["mean_l2"],
+                "max_linf_ref": ref_err["max_linf"],
+                "mean_resid_oos": resid_oos["mean"],
+                "mean_constraint_violation_raw": mean_c_raw,
+                "mean_constraint_violation_proj": mean_c_proj,
+                "drift_rate": drift,
+            }
+            
+            # 新增投影相关指标（仅TwoStage方法有）
+            if resid_oos_proj:
+                ablation_entry["mean_resid_oos_proj"] = resid_oos_proj["mean"]
+                ablation_entry["resid_ratio_proj_over_raw"] = resid_oos_proj["mean"] / resid_oos["mean"]
+            if proj_stats:
+                ablation_entry.update(proj_stats)
+
+            pde_ablation[MethodCls.label] = ablation_entry
+
+            # 原有预测场保存逻辑完全不动
+            x_t = torch.tensor(x_ref, device=DEVICE, dtype=torch.float32).unsqueeze(1)
+            t_t = torch.tensor(t_ref, device=DEVICE, dtype=torch.float32).unsqueeze(1)
+
+            nt = t_t.shape[0]
+            nx = x_t.shape[0]
+
+            x_all = x_t.repeat(nt, 1)
+            t_all = t_t.repeat_interleave(nx, dim=0)
+            xt_all = torch.cat([x_all, t_all], dim=1)
+
+            pred_path = os.path.join(RESULT_DIR, f"pred_{pde_name}_{MethodCls.label}.npz")
+
+            if isinstance(model, TwoStageProjPINN):
+                with torch.no_grad():
+                    u_raw_all = model.forward_raw(xt_all).reshape(nt, nx, out_dim).cpu().numpy()
+
+                with torch.enable_grad():
+                    chunk_size = 40000
+                    u_proj_list = []
+                    for start in range(0, xt_all.shape[0], chunk_size):
+                        end = start + chunk_size
+                        sub_xt = xt_all[start:end].detach().clone().requires_grad_(True)
+                        sub_u = model.forward_proj(sub_xt).detach()
+                        u_proj_list.append(sub_u)
+                    u_proj_all = torch.cat(u_proj_list, dim=0).reshape(nt, nx, out_dim).cpu().numpy()
+
+                np.savez_compressed(
+                    pred_path,
+                    x=x_ref,
+                    t=t_ref,
+                    u_raw=u_raw_all,
+                    u_proj=u_proj_all
+                )
+            else:
+                with torch.no_grad():
+                    u_pred_all = model(xt_all).reshape(nt, nx, out_dim).cpu().numpy()
+                np.savez_compressed(
+                    pred_path,
+                    x=x_ref,
+                    t=t_ref,
+                    u=u_pred_all
+                )
+            log.info(f"Saved field data -> {pred_path}")
+
+            # 新增：打印审稿人关心的关键指标
+            if pde_type == "dissipative":
+                log.info(
+                    f"[{MethodCls.label:18s}] |dE/dt+D|={conv['mean_abs_identity']:.3e} "
+                    f"L2={ref_err['mean_l2']:.3e}"
+                )
+            else:
+                if isinstance(model, TwoStageProjPINN):
+                    log.info(
+                        f"[{MethodCls.label:18s}] |c_raw|={mean_c_raw:.3e} |c_proj|={mean_c_proj:.3e} "
+                        f"L2_raw={ref_err['mean_l2']:.3e} L2_proj={ref_err_proj['mean_l2']:.3e}"
+                    )
+                    # 新增：打印残差比和投影幅度
+                    if resid_oos_proj:
+                        log.info(f"                     Resid ratio: {resid_oos_proj['mean']/resid_oos['mean']:.3f}x")
+                    if proj_stats:
+                        if out_dim == 1:
+                            log.info(f"                     Max |α|: {proj_stats['max_abs_alpha']:.3e}")
+                        else:
+                            log.info(f"                     Max |s-1|: {proj_stats['max_abs_s_minus_1']:.3e}")
+                else:
+                    log.info(
+                        f"[{MethodCls.label:18s}] |c_raw|={mean_c_raw:.3e} "
+                        f"|c_proj|={mean_c_proj:.3e} L2={ref_err['mean_l2']:.3e}"
+                    )
+
+        global_summary[pde_name] = pde_results
+        ablation_table[pde_name] = pde_ablation
+        conservation_data[pde_name] = pde_conservation
+        lambda_history[pde_name] = pde_lambda
+
+    with open(os.path.join(RESULT_DIR, "summary_results.json"), "w", encoding="utf-8") as f:
+        json.dump(global_summary, f, indent=2, ensure_ascii=False)
+
+    with open(os.path.join(RESULT_DIR, "ablation_table.json"), "w", encoding="utf-8") as f:
+        json.dump(ablation_table, f, indent=2, ensure_ascii=False)
+
+    log.info("\n=============================================")
+    log.info("All experiments finished successfully!")
+    log.info(f"All results saved in: {RESULT_DIR}")
+    log.info("✅ Indentation error FIXED 100%")
+    log.info("✅ TwoStage-Proj: raw vs proj L2/L∞ fully compared")
+    log.info("✅ ✅ NEW: Residual preservation test (reviewer required)")
+    log.info("✅ ✅ NEW: Projection amplitude statistics (reviewer required)")
+    log.info("✅ JSON + NPZ + LOG all have complete comparison")
+
+
+if __name__ == "__main__":
+    main()
