@@ -871,6 +871,24 @@ def save_method_stats(pde_name, method_label, stats):
     
     log.info(f"✓ Saved results for {method_label} to {stats_path}")
 
+# ======================
+# ✅ 最小新增：保存损失曲线到 JSON
+# ======================
+def save_loss_curve(pde_name, method_label, seed, loss_rec):
+    safe = method_label.replace(" ", "_")
+    path = os.path.join(CURVES_DIR, f"loss_{pde_name}_{safe}_seed{seed}.json")
+    data = {
+        "Lp": loss_rec.Lp,
+        "Lic": loss_rec.Lic,
+        "Cinv": loss_rec.Cinv,
+        "Linv": loss_rec.Linv,
+        "Ltot": loss_rec.Ltot,
+        "lam_ic": loss_rec.lam_ic,
+        "lam_inv": loss_rec.lam_inv,
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
 
 # ==============================================================================
 # STATISTICS FRAMEWORK (PATCH 6: KEY UNIFICATION)
@@ -1326,6 +1344,7 @@ def train_model(model, residual_fn, ic_fn, inv_fn, inv0, tau, pde_name, seed, de
     peak_gpu_memory = 0.0
     if DEVICE.type == "cuda":
         peak_gpu_memory = torch.cuda.max_memory_allocated() / (1024**3)
+    save_loss_curve(pde_name, model.label, seed, rec)
     
     return rec, model, train_time, peak_gpu_memory
 
